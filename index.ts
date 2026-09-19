@@ -2,12 +2,22 @@ import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+
+import { connectForum } from "./forum-client.mjs";
+import { accepts, threadParams, sessionNameFromTopic } from "./forum.mjs";
+
+interface ForumBinding {
+	chatId: number;
+	messageThreadId: number;
+	topicName: string;
+}
 
 interface TelegramConfig {
+	forumChatId?: number;
 	botToken?: string;
 	botUsername?: string;
 	botId?: number;
@@ -19,13 +29,11 @@ interface TelegramApiResponse<T> {
 	ok: boolean;
 	result?: T;
 	description?: string;
-	error_code?: number;
 }
 
 interface TelegramUser {
 	id: number;
 	is_bot: boolean;
-	first_name: string;
 	username?: string;
 }
 
@@ -39,43 +47,14 @@ interface TelegramPhotoSize {
 	file_size?: number;
 }
 
-interface TelegramDocument {
+interface TelegramMedia {
 	file_id: string;
 	file_name?: string;
 	mime_type?: string;
-	file_size?: number;
-}
-
-interface TelegramVideo {
-	file_id: string;
-	file_name?: string;
-	mime_type?: string;
-	file_size?: number;
-}
-
-interface TelegramAudio {
-	file_id: string;
-	file_name?: string;
-	mime_type?: string;
-	file_size?: number;
-}
-
-interface TelegramVoice {
-	file_id: string;
-	mime_type?: string;
-	file_size?: number;
-}
-
-interface TelegramAnimation {
-	file_id: string;
-	file_name?: string;
-	mime_type?: string;
-	file_size?: number;
 }
 
 interface TelegramSticker {
 	file_id: string;
-	emoji?: string;
 }
 
 interface TelegramFileInfo {
@@ -86,6 +65,8 @@ interface TelegramFileInfo {
 }
 
 interface TelegramMessage {
+	forum_topic_edited?: { name?: string };
+	message_thread_id?: number;
 	message_id: number;
 	chat: TelegramChat;
 	from?: TelegramUser;
@@ -93,11 +74,11 @@ interface TelegramMessage {
 	caption?: string;
 	media_group_id?: string;
 	photo?: TelegramPhotoSize[];
-	document?: TelegramDocument;
-	video?: TelegramVideo;
-	audio?: TelegramAudio;
-	voice?: TelegramVoice;
-	animation?: TelegramAnimation;
+	document?: TelegramMedia;
+	video?: TelegramMedia;
+	audio?: TelegramMedia;
+	voice?: TelegramMedia;
+	animation?: TelegramMedia;
 	sticker?: TelegramSticker;
 }
 
@@ -124,13 +105,10 @@ interface DownloadedTelegramFile {
 
 interface PendingTelegramTurn {
 	chatId: number;
-	replyToMessageId: number;
 	queuedAttachments: QueuedAttachment[];
 	content: Array<TextContent | ImageContent>;
 	historyText: string;
 }
-
-type ActiveTelegramTurn = PendingTelegramTurn;
 
 interface QueuedAttachment {
 	path: string;
@@ -198,10 +176,6 @@ function guessMediaType(path: string): string | undefined {
 	if (ext === ".webp") return "image/webp";
 	if (ext === ".gif") return "image/gif";
 	return undefined;
-}
-
-function isImageMimeType(mimeType: string | undefined): boolean {
-	return mimeType?.toLowerCase().startsWith("image/") ?? false;
 }
 
 function formatTokens(count: number): string {
@@ -286,10 +260,14 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
+	let forumBinding: ForumBinding | undefined;
+	let forumConnection: { close(): void; rename(name: string, force?: boolean): void } | undefined;
+	let telegramSessionName: string | undefined;
+	let connectionEpoch = 0;
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
-	let activeTelegramTurn: ActiveTelegramTurn | undefined;
+	let activeTelegramTurn: PendingTelegramTurn | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
@@ -298,6 +276,10 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	function isBusy(ctx: ExtensionContext): boolean {
+		return !ctx.isIdle() || !!activeTelegramTurn || queuedTelegramTurns.length > 0 || mediaGroups.size > 0;
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -315,7 +297,7 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
 			return;
 		}
-		if (!pollingPromise) {
+		if (!pollingPromise && !forumConnection) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "disconnected")}`);
 			return;
 		}
@@ -333,41 +315,14 @@ export default function (pi: ExtensionAPI) {
 
 	async function callTelegram<TResponse>(
 		method: string,
-		body: Record<string, unknown>,
+		body: Record<string, unknown> | FormData,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
 		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
 			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify(body),
-			signal: options?.signal,
-		});
-			const data = (await response.json()) as TelegramApiResponse<TResponse>;
-		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
-		}
-		return data.result;
-	}
-
-	async function callTelegramMultipart<TResponse>(
-		method: string,
-		fields: Record<string, string>,
-		fileField: string,
-		filePath: string,
-		fileName: string,
-		options?: { signal?: AbortSignal },
-	): Promise<TResponse> {
-		if (!config.botToken) throw new Error("Telegram bot token is not configured");
-		const form = new FormData();
-		for (const [key, value] of Object.entries(fields)) {
-			form.set(key, value);
-		}
-		const buffer = await readFile(filePath);
-		form.set(fileField, new Blob([buffer]), fileName);
-		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
-			method: "POST",
-			body: form,
+			headers: body instanceof FormData ? undefined : { "content-type": "application/json" },
+			body: body instanceof FormData ? body : JSON.stringify(threadParams(method, body, forumBinding)),
 			signal: options?.signal,
 		});
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
@@ -375,6 +330,23 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
 		return data.result;
+	}
+
+	async function callTelegramMultipart(
+		method: string,
+		fields: Record<string, string>,
+		fileField: string,
+		filePath: string,
+		fileName: string,
+		options?: { signal?: AbortSignal },
+	): Promise<void> {
+		const form = new FormData();
+		for (const [key, value] of Object.entries(threadParams(method, fields, forumBinding))) {
+			form.set(key, String(value));
+		}
+		const buffer = await readFile(filePath);
+		form.set(fileField, new Blob([buffer]), fileName);
+		await callTelegram(method, form, options);
 	}
 
 	async function downloadTelegramFile(fileId: string, suggestedName: string): Promise<string> {
@@ -483,48 +455,38 @@ export default function (pi: ExtensionAPI) {
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
 		previewState.flushTimer = setTimeout(() => {
-			void flushPreview(chatId);
+			void flushPreview(chatId).catch(() => { /* Final delivery reports Telegram errors. */ });
 		}, PREVIEW_THROTTLE_MS);
 	}
 
-	async function finalizePreview(chatId: number): Promise<boolean> {
+	async function finalizePreview(chatId: number): Promise<void> {
 		const state = previewState;
-		if (!state) return false;
+		if (!state) return;
 		await flushPreview(chatId);
 		const finalText = (state.pendingText.trim() || state.lastSentText).trim();
 		if (!finalText) {
 			await clearPreview(chatId);
-			return false;
-		}
-		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+		} else if (state.mode === "draft") {
+			await callTelegram("sendMessage", { chat_id: chatId, text: finalText });
 			await clearPreview(chatId);
-			return true;
+		} else {
+			previewState = undefined;
 		}
-		previewState = undefined;
-		return state.messageId !== undefined;
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
-		let lastMessageId: number | undefined;
-		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
+	async function sendTextReply(chatId: number, text: string): Promise<void> {
+		for (const chunk of chunkParagraphs(text)) {
+			await callTelegram("sendMessage", { chat_id: chatId, text: chunk });
 		}
-		return lastMessageId;
 	}
 
-	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
+	async function sendQueuedAttachments(turn: PendingTelegramTurn): Promise<void> {
 		for (const attachment of turn.queuedAttachments) {
 			try {
 				const mediaType = guessMediaType(attachment.path);
 				const method = mediaType ? "sendPhoto" : "sendDocument";
 				const fieldName = mediaType ? "photo" : "document";
-				await callTelegramMultipart<TelegramSentMessage>(
+				await callTelegramMultipart(
 					method,
 					{
 						chat_id: String(turn.chatId),
@@ -535,7 +497,7 @@ export default function (pi: ExtensionAPI) {
 				);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
+				await sendTextReply(turn.chatId, `Failed to send attachment ${attachment.fileName}: ${message}`);
 			}
 		}
 	}
@@ -546,13 +508,7 @@ export default function (pi: ExtensionAPI) {
 			if (message.role !== "assistant") continue;
 			const stopReason = typeof message.stopReason === "string" ? message.stopReason : undefined;
 			const errorMessage = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
-			const content = Array.isArray(message.content) ? message.content : [];
-			const text = content
-				.filter((block): block is { type: string; text?: string } => typeof block === "object" && block !== null && "type" in block)
-				.filter((block) => block.type === "text" && typeof block.text === "string")
-				.map((block) => block.text as string)
-				.join("")
-				.trim();
+			const text = getMessageText(messages[i]);
 			return { text: text || undefined, stopReason, errorMessage };
 		}
 		return {};
@@ -560,6 +516,9 @@ export default function (pi: ExtensionAPI) {
 
 	function collectTelegramFileInfos(messages: TelegramMessage[]): TelegramFileInfo[] {
 		const files: TelegramFileInfo[] = [];
+		const mediaTypes = {
+			document: "", video: ".mp4", audio: ".mp3", voice: ".ogg", animation: ".mp4",
+		} as const;
 		for (const message of messages) {
 			if (Array.isArray(message.photo) && message.photo.length > 0) {
 				const photo = [...message.photo].sort((a, b) => (a.file_size ?? 0) - (b.file_size ?? 0)).pop();
@@ -572,48 +531,15 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 			}
-			if (message.document) {
-				const fileName = message.document.file_name || `document-${message.message_id}${guessExtensionFromMime(message.document.mime_type, "")}`;
+			for (const kind of Object.keys(mediaTypes) as Array<keyof typeof mediaTypes>) {
+				const media = message[kind];
+				if (!media) continue;
+				const extension = guessExtensionFromMime(media.mime_type, mediaTypes[kind]);
 				files.push({
-					file_id: message.document.file_id,
-					fileName,
-					mimeType: message.document.mime_type,
-					isImage: isImageMimeType(message.document.mime_type),
-				});
-			}
-			if (message.video) {
-				const fileName = message.video.file_name || `video-${message.message_id}${guessExtensionFromMime(message.video.mime_type, ".mp4")}`;
-				files.push({
-					file_id: message.video.file_id,
-					fileName,
-					mimeType: message.video.mime_type,
-					isImage: false,
-				});
-			}
-			if (message.audio) {
-				const fileName = message.audio.file_name || `audio-${message.message_id}${guessExtensionFromMime(message.audio.mime_type, ".mp3")}`;
-				files.push({
-					file_id: message.audio.file_id,
-					fileName,
-					mimeType: message.audio.mime_type,
-					isImage: false,
-				});
-			}
-			if (message.voice) {
-				files.push({
-					file_id: message.voice.file_id,
-					fileName: `voice-${message.message_id}${guessExtensionFromMime(message.voice.mime_type, ".ogg")}`,
-					mimeType: message.voice.mime_type,
-					isImage: false,
-				});
-			}
-			if (message.animation) {
-				const fileName = message.animation.file_name || `animation-${message.message_id}${guessExtensionFromMime(message.animation.mime_type, ".mp4")}`;
-				files.push({
-					file_id: message.animation.file_id,
-					fileName,
-					mimeType: message.animation.mime_type,
-					isImage: false,
+					file_id: media.file_id,
+					fileName: media.file_name || `${kind}-${message.message_id}${extension}`,
+					mimeType: media.mime_type,
+					isImage: kind === "document" && (media.mime_type?.toLowerCase().startsWith("image/") ?? false),
 				});
 			}
 			if (message.sticker) {
@@ -639,6 +565,10 @@ export default function (pi: ExtensionAPI) {
 
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI || setupInProgress) return;
+		if (pollingPromise || forumConnection || isBusy(ctx)) {
+			ctx.ui.notify("Disconnect Telegram and wait for Pi to become idle before setup.", "warning");
+			return;
+		}
 		setupInProgress = true;
 		try {
 			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
@@ -666,6 +596,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function stopPolling(): Promise<void> {
+		connectionEpoch++;
+		forumConnection?.close();
+		forumConnection = undefined;
+		forumBinding = undefined;
 		stopTypingLoop();
 		pollingController?.abort();
 		pollingController = undefined;
@@ -728,7 +662,6 @@ export default function (pi: ExtensionAPI) {
 
 		return {
 			chatId: firstMessage.chat.id,
-			replyToMessageId: firstMessage.message_id,
 			queuedAttachments: [],
 			content,
 			historyText: formatTelegramHistoryText(rawText, files),
@@ -739,7 +672,11 @@ export default function (pi: ExtensionAPI) {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		const lower = rawText.toLowerCase();
+		let lower = rawText.toLowerCase();
+		if (forumBinding && config.botUsername) {
+			const suffix = `@${config.botUsername.toLowerCase()}`;
+			if (lower.startsWith("/") && lower.endsWith(suffix)) lower = lower.slice(0, -suffix.length);
+		}
 
 		if (lower === "stop" || lower === "/stop") {
 			if (currentAbort) {
@@ -748,28 +685,28 @@ export default function (pi: ExtensionAPI) {
 				}
 				currentAbort();
 				updateStatus(ctx);
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
+				await sendTextReply(firstMessage.chat.id, "Aborted current turn.");
 			} else {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "No active turn.");
+				await sendTextReply(firstMessage.chat.id, "No active turn.");
 			}
 			return;
 		}
 
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
-				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
+				await sendTextReply(firstMessage.chat.id, "Cannot compact while pi is busy. Send \"stop\" first.");
 				return;
 			}
 			ctx.compact({
 				onComplete: () => {
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.");
+					void sendTextReply(firstMessage.chat.id, "Compaction completed.");
 				},
 				onError: (error) => {
 					const message = error instanceof Error ? error.message : String(error);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`);
+					void sendTextReply(firstMessage.chat.id, `Compaction failed: ${message}`);
 				},
 			});
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			await sendTextReply(firstMessage.chat.id, "Compaction started.");
 			return;
 		}
 
@@ -816,14 +753,13 @@ export default function (pi: ExtensionAPI) {
 			if (lines.length === 0) {
 				lines.push("No usage data yet.");
 			}
-			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, lines.join("\n"));
+			await sendTextReply(firstMessage.chat.id, lines.join("\n"));
 			return;
 		}
 
 		if (lower === "/help" || lower === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
-				firstMessage.message_id,
 				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
@@ -836,7 +772,9 @@ export default function (pi: ExtensionAPI) {
 
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
+		const epoch = connectionEpoch;
 		const turn = await createTelegramTurn(messages, historyTurns);
+		if (epoch !== connectionEpoch) return;
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
@@ -847,7 +785,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
 		if (message.media_group_id) {
-			const key = `${message.chat.id}:${message.media_group_id}`;
+			const key = `${message.chat.id}:${message.message_thread_id ?? "private"}:${message.media_group_id}`;
 			const existing = mediaGroups.get(key) ?? { messages: [] };
 			existing.messages.push(message);
 			if (existing.flushTimer) clearTimeout(existing.flushTimer);
@@ -855,7 +793,9 @@ export default function (pi: ExtensionAPI) {
 				const state = mediaGroups.get(key);
 				mediaGroups.delete(key);
 				if (!state) return;
-				void dispatchAuthorizedTelegramMessages(state.messages, ctx);
+				void dispatchAuthorizedTelegramMessages(state.messages, ctx).catch(error => {
+					updateStatus(ctx, error instanceof Error ? error.message : String(error));
+				});
 			}, TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS);
 			mediaGroups.set(key, existing);
 			return;
@@ -866,17 +806,35 @@ export default function (pi: ExtensionAPI) {
 
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
 		const message = update.message || update.edited_message;
-		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
+		if (!message || !message.from || message.from.is_bot) return;
+		if (forumBinding) {
+			if (!accepts(message, forumBinding, config.allowedUserId)) return;
+		} else if (message.chat.type !== "private") return;
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
 			await writeConfig(config);
 			updateStatus(ctx);
-			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+			await sendTextReply(message.chat.id, "Telegram bridge paired with this account.");
 		}
 
 		if (message.from.id !== config.allowedUserId) {
-			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+			await sendTextReply(message.chat.id, "This bot is not authorized for your account.");
+			return;
+		}
+
+		if (forumBinding && message.forum_topic_edited) {
+			const topicName = message.forum_topic_edited.name;
+			// Icon-only edits are service messages too, never agent prompts.
+			if (typeof topicName !== "string" || !topicName.trim()) return;
+			const name = sessionNameFromTopic(topicName);
+			if (pi.getSessionName() !== name) {
+				telegramSessionName = name;
+				pi.setSessionName(name);
+			}
+			// Restore the π prefix even if the cached mapping already has this name.
+			forumConnection?.rename(name, true);
+			ctx.ui.notify(`Session renamed from Telegram: ${name}`, "info");
 			return;
 		}
 
@@ -934,7 +892,43 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
-		if (!config.botToken || pollingPromise) return;
+		if (!config.botToken || pollingPromise || forumConnection) return;
+		if (config.forumChatId !== undefined) {
+			const epoch = ++connectionEpoch;
+			const connection = await connectForum(
+				{
+					sessionFile: ctx.sessionManager.getSessionFile(),
+					sessionId: ctx.sessionManager.getSessionId(),
+					name: pi.getSessionName() || basename(ctx.cwd),
+				},
+				{
+					onUpdate: async (update: TelegramUpdate) => {
+						if (epoch === connectionEpoch) await handleUpdate(update, ctx);
+					},
+					onError: (error: string) => {
+						if (epoch === connectionEpoch) updateStatus(ctx, error);
+					},
+					onClose: () => {
+						if (epoch !== connectionEpoch) return;
+						connectionEpoch++;
+						forumConnection = undefined;
+						updateStatus(ctx, "dispatcher disconnected; run /telegram-connect again");
+					},
+				},
+			);
+			if (epoch !== connectionEpoch) {
+				connection.close();
+				return;
+			}
+			forumBinding = connection.binding;
+			forumConnection = connection;
+			draftSupport = "unsupported";
+			ctx.ui.notify(`Telegram topic: ${connection.binding.topicName} (${connection.binding.messageThreadId})`, "info");
+			updateStatus(ctx);
+			return;
+		}
+		forumBinding = undefined;
+		draftSupport = "unknown";
 		pollingController = new AbortController();
 		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
 			pollingPromise = undefined;
@@ -991,7 +985,8 @@ export default function (pi: ExtensionAPI) {
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
-				`polling: ${pollingPromise ? "running" : "stopped"}`,
+				`polling: ${forumConnection ? "dispatcher" : pollingPromise ? "running" : "stopped"}`,
+				`topic: ${forumBinding ? `${forumBinding.chatId}/${forumBinding.messageThreadId}` : "private"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
 			];
@@ -1002,6 +997,14 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
+			if (pollingPromise || forumConnection) {
+				ctx.ui.notify("Already connected. Disconnect before changing configuration.", "info");
+				return;
+			}
+			if (isBusy(ctx)) {
+				ctx.ui.notify("Wait for Pi to become idle before connecting.", "warning");
+				return;
+			}
 			config = await readConfig();
 			if (!config.botToken) {
 				await promptForConfig(ctx);
@@ -1015,9 +1018,22 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-disconnect", {
 		description: "Stop the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
+			if (isBusy(ctx)) {
+				ctx.ui.notify("Wait for Pi to become idle before disconnecting.", "warning");
+				return;
+			}
 			await stopPolling();
 			updateStatus(ctx);
 		},
+	});
+
+	pi.on("session_info_changed", async (event, ctx) => {
+		if (telegramSessionName !== undefined && telegramSessionName === event.name) {
+			telegramSessionName = undefined;
+			return;
+		}
+		telegramSessionName = undefined;
+		forumConnection?.rename(event.name || basename(ctx.cwd));
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
@@ -1095,7 +1111,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (assistant.stopReason === "error") {
 			await clearPreview(turn.chatId);
-			await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+			await sendTextReply(turn.chatId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
 			return;
 		}
 
@@ -1105,16 +1121,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
-			const finalized = await finalizePreview(turn.chatId);
-			if (!finalized && turn.queuedAttachments.length > 0 && !finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
-			}
+			await finalizePreview(turn.chatId);
 		} else {
 			await clearPreview(turn.chatId);
 			if (finalText) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+				await sendTextReply(turn.chatId, finalText);
 			} else if (turn.queuedAttachments.length > 0) {
-				await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+				await sendTextReply(turn.chatId, "Attached requested file(s).");
 			}
 		}
 
