@@ -269,6 +269,8 @@ export default function (pi: ExtensionAPI) {
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
 	let activeTelegramTurn: PendingTelegramTurn | undefined;
 	let typingInterval: ReturnType<typeof setInterval> | undefined;
+	let typingController: AbortController | undefined;
+	let shuttingDown = false;
 	let currentAbort: (() => void) | undefined;
 	let preserveQueuedTurnsAsHistory = false;
 	let setupInProgress = false;
@@ -287,6 +289,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function updateStatus(ctx: ExtensionContext, error?: string): void {
+		if (shuttingDown) return;
 		const theme = ctx.ui.theme;
 		const label = theme.fg("accent", "telegram");
 		if (error) {
@@ -363,12 +366,15 @@ export default function (pi: ExtensionAPI) {
 
 	function startTypingLoop(ctx: ExtensionContext, chatId?: number): void {
 		const targetChatId = chatId ?? activeTelegramTurn?.chatId;
-		if (typingInterval || targetChatId === undefined) return;
+		if (shuttingDown || typingInterval || targetChatId === undefined) return;
+		const controller = new AbortController();
+		typingController = controller;
 
 		const sendTyping = async (): Promise<void> => {
 			try {
-				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" });
+				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" }, { signal: controller.signal });
 			} catch (error) {
+				if (controller.signal.aborted || shuttingDown) return;
 				const message = error instanceof Error ? error.message : String(error);
 				updateStatus(ctx, `typing failed: ${message}`);
 			}
@@ -381,6 +387,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function stopTypingLoop(): void {
+		typingController?.abort();
+		typingController = undefined;
 		if (!typingInterval) return;
 		clearInterval(typingInterval);
 		typingInterval = undefined;
@@ -779,7 +787,7 @@ export default function (pi: ExtensionAPI) {
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content);
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
 		}
 	}
 
@@ -1043,6 +1051,8 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
+		shuttingDown = true;
+		stopTypingLoop();
 		queuedTelegramTurns = [];
 		for (const state of mediaGroups.values()) {
 			if (state.flushTimer) clearTimeout(state.flushTimer);
@@ -1137,7 +1147,8 @@ export default function (pi: ExtensionAPI) {
 			const nextTurn = queuedTelegramTurns[0];
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(nextTurn.content);
+			// agent_end can fire while Pi is still processing the current run.
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
 		}
 	});
 }

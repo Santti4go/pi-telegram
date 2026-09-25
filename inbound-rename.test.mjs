@@ -14,9 +14,10 @@ test('real extension: rename isolation, media downloads and topic-scoped replies
   const state = { renames: [], prompts: [] };
   globalThis.__telegramExtensionTest = state;
   let name = 'old';
+  let busy = false;
   const hooks = new Map(); const commands = new Map(); const tools = new Map();
   const ctx = {
-    cwd: '/project', isIdle: () => true,
+    cwd: '/project', isIdle: () => !busy,
     sessionManager: { getSessionFile: () => '/alpha.jsonl', getSessionId: () => 'alpha' },
     ui: { notify() {}, setStatus() {}, theme: { fg: (_color, text) => text } },
   };
@@ -33,7 +34,11 @@ test('real extension: rename isolation, media downloads and topic-scoped replies
       registerCommand(command, def) { commands.set(command, def.handler); },
       getSessionName: () => name,
       setSessionName(value) { name = value; void hooks.get('session_info_changed')({ name }, ctx); },
-      sendUserMessage(value) { state.prompts.push(value); },
+      sendUserMessage(value, options) {
+        assert.equal(options?.deliverAs, 'followUp');
+        if (busy && !options?.deliverAs) throw new Error('Agent is already processing');
+        state.prompts.push(value);
+      },
     });
     await hooks.get('session_start')({}, ctx);
     await commands.get('telegram-connect')('', ctx);
@@ -88,11 +93,21 @@ test('real extension: rename isolation, media downloads and topic-scoped replies
     assert.deepEqual(content.filter(c => c.type === 'image').map(c => c.mimeType), ['image/jpeg', 'image/png', 'image/webp']);
 
     // JSON sends and multipart uploads must retain their content types and topic routing.
+    busy = true;
     await hooks.get('agent_start')({}, ctx);
+    // A second Telegram message waits locally until agent_end, which is still busy.
+    await state.onUpdate({ message: { ...message, forum_topic_edited: undefined, text: 'Next request' } });
+    assert.equal(state.prompts.length, 1);
     const attachment = join(home, 'result.txt');
     await writeFile(attachment, 'result');
     await tools.get('telegram_attach').execute('attach', { paths: [attachment] });
     await hooks.get('agent_end')({ messages: [{ role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'Done' }] }] }, ctx);
+    assert.equal(state.prompts.length, 2);
+    assert.ok(state.prompts[1][0].text.includes('Next request'));
+    await hooks.get('agent_start')({}, ctx);
+    await hooks.get('agent_end')({ messages: [] }, ctx);
+    assert.equal(state.prompts.length, 2, 'queued message must only be submitted once');
+    busy = false;
     const reply = requests.find(r => r.method === 'sendMessage');
     assert.deepEqual(reply.body, { chat_id: -100, text: 'Done', message_thread_id: 42 });
     const upload = requests.find(r => r.method === 'sendDocument');
@@ -104,6 +119,21 @@ test('real extension: rename isolation, media downloads and topic-scoped replies
     await state.onUpdate({ message: { ...message, forum_topic_edited: undefined, text: '/help' } });
     assert.ok(requests.at(-1).body.text.startsWith('Send me a message'));
     assert.equal(requests.at(-1).body.message_thread_id, 42);
+
+    // A typing request can reject after shutdown, when ctx.ui is already stale.
+    let rejectTyping;
+    let typingSignal;
+    globalThis.fetch = async (_url, options) => {
+      typingSignal = options.signal;
+      return new Promise((_resolve, reject) => { rejectTyping = reject; });
+    };
+    await state.onUpdate({ message: { ...message, forum_topic_edited: undefined, text: 'Pending typing' } });
+    assert.equal(typeof rejectTyping, 'function');
+    await hooks.get('session_shutdown')({}, ctx);
+    assert.equal(typingSignal.aborted, true);
+    Object.defineProperty(ctx, 'ui', { get() { throw new Error('stale ctx'); } });
+    rejectTyping(new Error('late network failure'));
+    await new Promise(resolve => setImmediate(resolve));
   } finally {
     if (hooks.has('session_shutdown')) await hooks.get('session_shutdown')({}, ctx);
     if (originalHome === undefined) delete process.env.HOME; else process.env.HOME = originalHome;
