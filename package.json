@@ -2,8 +2,20 @@
   "name": "pi-telegram",
   "version": "0.1.0",
   "private": false,
-  "description": "Telegram DM bridge extension for pi",
+  "description": "Telegram DM and forum-topic bridge extension for pi",
   "type": "module",
+  "scripts": {
+    "test": "node --test *.test.mjs",
+    "test:e2e": "node test/e2e-multitopic.mjs"
+  },
+  "files": [
+    "index.ts",
+    "dispatcher.mjs",
+    "forum-client.mjs",
+    "forum.mjs",
+    "README.md",
+    "screenshot.png"
+  ],
   "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
   "license": "MIT",
   "repository": {
@@ -18,9 +30,12 @@
     "extensions": ["./index.ts"]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
   }
 }
