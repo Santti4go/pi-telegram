@@ -22,19 +22,12 @@ Reporte de referencia histórica: [`results/rpc-six-2026-09-24.json`](results/rp
 
 ```mermaid
 flowchart TB
-    Runner[Orquestador: rpc-full-flow.mjs] -->|JSONL por stdin: control y conexión| Pi[6 procesos Pi en modo RPC]
-    Pi -->|JSONL por stdout: streaming, herramientas, estado| Runner
-    Runner -->|Inyecta mensajes dummy por tópico| Mock[API Telegram local simulada]
-    Dispatcher[Dispatcher real compartido] -->|getUpdates: 1 poller global| Mock
-    Dispatcher -->|Socket Unix: enrutado por topic_id| Bridge[index.ts real en cada Pi]
-    Pi --- Bridge
-    Bridge --> Agent[Agente real de Pi]
-    Agent <-->|Llamadas HTTPS reales| Model[openai-codex / gpt-5.4-mini]
-    Agent --> Read[Herramienta read: archivo dummy descargado]
-    Agent --> Attach[Herramienta telegram_attach real]
-    Attach --> Bridge
-    Bridge -->|typing, respuesta y subida multipart| Mock
-    Mock --> Verify[Verificar tópico, marcadores y bytes exactos]
+    Runner["Runner (rpc-full-flow.mjs)"] -->|"Inyecta mensajes y archivos"| Mock["Mock Telegram API (localhost)"]
+    Dispatcher["Dispatcher Real"] <-->|"1 polling global (getUpdates)"| Mock
+    Dispatcher -->|"Sockets Unix (por tópico)"| Sessions["6 Sesiones Pi Concurrentes (--mode rpc)"]
+    Sessions <-->|"Razonamiento y herramientas (read / attach)"| Model["Modelo Real (gpt-5.4-mini)"]
+    Sessions -->|"Respuestas y adjuntos (multipart)"| Mock
+    Runner -.->|"Control y aserciones por RPC"| Sessions
 ```
 
 **Por qué no enviar los mensajes dummy directamente por RPC:**  
