@@ -5,7 +5,8 @@
   "description": "Telegram DM and forum-topic bridge extension for pi",
   "type": "module",
   "scripts": {
-    "test": "node --test *.test.mjs"
+    "test": "node --test *.test.mjs",
+    "test:e2e": "node test/e2e-multitopic.mjs"
   },
   "files": [
     "index.ts",
