@@ -3,11 +3,12 @@ import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 import { connectForum } from "./forum-client.mjs";
+import { parseTelegramCommand, findSessionCommand } from "./commands.mjs";
 import { accepts, threadParams, sessionNameFromTopic } from "./forum.mjs";
 
 interface ForumBinding {
@@ -108,6 +109,7 @@ interface PendingTelegramTurn {
 	queuedAttachments: QueuedAttachment[];
 	content: Array<TextContent | ImageContent>;
 	historyText: string;
+	expandPromptTemplates?: boolean;
 }
 
 interface QueuedAttachment {
@@ -121,6 +123,7 @@ interface TelegramPreviewState {
 	messageId?: number;
 	pendingText: string;
 	lastSentText: string;
+	flushPromise?: Promise<void>;
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
@@ -129,10 +132,12 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+const RELOAD_MARKER = "PI_TELEGRAM_PENDING_RELOAD";
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
+const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
@@ -278,6 +283,9 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	let modelChoices: string[] = [];
+	let modelCommandInProgress = false;
+	let reloadRequest: { chatId: number; messageThreadId?: number } | undefined;
 
 	function isBusy(ctx: ExtensionContext): boolean {
 		return !ctx.isIdle() || !!activeTelegramTurn || queuedTelegramTurns.length > 0 || mediaGroups.size > 0;
@@ -417,6 +425,8 @@ export default function (pi: ExtensionAPI) {
 			state.flushTimer = undefined;
 		}
 		previewState = undefined;
+		// Let an in-flight request finish before clearing its draft or replacing it.
+		await state.flushPromise?.catch(() => undefined);
 		if (state.mode === "draft" && state.draftId !== undefined) {
 			try {
 				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: state.draftId, text: "" });
@@ -429,10 +439,21 @@ export default function (pi: ExtensionAPI) {
 	async function flushPreview(chatId: number): Promise<void> {
 		const state = previewState;
 		if (!state) return;
+		if (state.flushTimer) clearTimeout(state.flushTimer);
 		state.flushTimer = undefined;
-		const text = state.pendingText.trim();
-		if (!text || text === state.lastSentText) return;
-		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+		// Timer and final delivery can flush concurrently. Serialize per preview;
+		// read pendingText only after the preceding request updates lastSentText.
+		const task = (state.flushPromise ?? Promise.resolve()).catch(() => undefined).then(async () => {
+			if (previewState !== state) return;
+			await flushPreviewState(chatId, state);
+		});
+		state.flushPromise = task;
+		await task;
+	}
+
+	async function flushPreviewState(chatId: number, state: TelegramPreviewState): Promise<void> {
+		const truncated = state.pendingText.trim().slice(0, MAX_MESSAGE_LENGTH);
+		if (!truncated || truncated === state.lastSentText) return;
 
 		if (draftSupport !== "unsupported") {
 			const draftId = state.draftId ?? allocateDraftId();
@@ -455,14 +476,22 @@ export default function (pi: ExtensionAPI) {
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		} catch (error) {
+			// Telegram's idempotent edit rejection means delivery already succeeded.
+			// Do not suppress other failures (permissions, networking, missing message).
+			if (!(error instanceof Error) || !/^Bad Request: message is not modified\b/i.test(error.message)) throw error;
+		}
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
 
 	function schedulePreviewFlush(chatId: number): void {
 		if (!previewState || previewState.flushTimer) return;
-		previewState.flushTimer = setTimeout(() => {
+		const state = previewState;
+		state.flushTimer = setTimeout(() => {
+			if (previewState !== state) return;
 			void flushPreview(chatId).catch(() => { /* Final delivery reports Telegram errors. */ });
 		}, PREVIEW_THROTTLE_MS);
 	}
@@ -605,6 +634,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function stopPolling(): Promise<void> {
 		connectionEpoch++;
+		modelChoices = [];
 		forumConnection?.close();
 		forumConnection = undefined;
 		forumBinding = undefined;
@@ -680,11 +710,10 @@ export default function (pi: ExtensionAPI) {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		let lower = rawText.toLowerCase();
-		if (forumBinding && config.botUsername) {
-			const suffix = `@${config.botUsername.toLowerCase()}`;
-			if (lower.startsWith("/") && lower.endsWith(suffix)) lower = lower.slice(0, -suffix.length);
-		}
+		const command = messages.length === 1 && !collectTelegramFileInfos(messages).length
+			? parseTelegramCommand(rawText, config.botUsername) : undefined;
+		if (command?.ignored) return;
+		const lower = (command?.text ?? rawText).toLowerCase();
 
 		if (lower === "stop" || lower === "/stop") {
 			if (currentAbort) {
@@ -696,6 +725,97 @@ export default function (pi: ExtensionAPI) {
 				await sendTextReply(firstMessage.chat.id, "Aborted current turn.");
 			} else {
 				await sendTextReply(firstMessage.chat.id, "No active turn.");
+			}
+			return;
+		}
+
+		if (command?.name === "reload") {
+			if (command.args) {
+				await sendTextReply(firstMessage.chat.id, "Usage: /reload");
+				return;
+			}
+			if (isBusy(ctx) || modelCommandInProgress || reloadRequest) {
+				await sendTextReply(firstMessage.chat.id, "Cannot reload while Pi is busy. Wait until idle and try again.");
+				return;
+			}
+			reloadRequest = { chatId: firstMessage.chat.id, messageThreadId: firstMessage.message_thread_id };
+			// Lifecycle operations require a command context, not the poller's event context.
+			try {
+				pi.sendUserMessage("/telegram-reload", { expandPromptTemplates: true });
+			} catch (error) {
+				reloadRequest = undefined;
+				await sendTextReply(firstMessage.chat.id, `Reload dispatch failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
+
+		if (command?.name === "thinking") {
+			const level = command.args.toLowerCase();
+			if (!level) {
+				await sendTextReply(firstMessage.chat.id, `Current thinking level: ${pi.getThinkingLevel()}.\nUse /thinking ${THINKING_LEVELS.join("|")}. Model capabilities may limit the effective level.`);
+				return;
+			}
+			if (!THINKING_LEVELS.includes(level as ThinkingLevel)) {
+				await sendTextReply(firstMessage.chat.id, `Invalid thinking level: ${command.args}.\nUse /thinking ${THINKING_LEVELS.join("|")}.`);
+				return;
+			}
+			if (isBusy(ctx) || modelCommandInProgress) {
+				await sendTextReply(firstMessage.chat.id, "Cannot change thinking while Pi is busy or a model command is running. Wait until idle and try again.");
+				return;
+			}
+			try {
+				pi.setThinkingLevel(level as ThinkingLevel);
+				const effective = pi.getThinkingLevel();
+				await sendTextReply(firstMessage.chat.id, effective === level
+					? `Thinking level set to ${effective}.`
+					: `Requested ${level}; thinking level set to ${effective} because of model capabilities.`);
+			} catch (error) {
+				await sendTextReply(firstMessage.chat.id, `Thinking command failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			return;
+		}
+
+		if (command?.name === "models" || command?.name === "model") {
+			if (modelCommandInProgress) {
+				await sendTextReply(firstMessage.chat.id, "A model command is already running. Try again shortly.");
+				return;
+			}
+			modelCommandInProgress = true;
+			try {
+				if (command.name === "model" && !command.args) {
+					await sendTextReply(firstMessage.chat.id, `Current model: ${ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "none"}\nUse /models to list models, then /model provider/model-id or /model number.`);
+					return;
+				}
+				if (command.name === "model" && isBusy(ctx)) {
+					await sendTextReply(firstMessage.chat.id, "Cannot switch model while Pi is busy. Send /stop first and wait for Pi to become idle.");
+					return;
+				}
+				await ctx.modelRegistry.refresh();
+				const models = ctx.modelRegistry.getAvailable();
+				if (command.name === "model" && isBusy(ctx)) {
+					await sendTextReply(firstMessage.chat.id, "Pi became busy while refreshing models. Try again when idle.");
+					return;
+				}
+				if (command.name === "models") {
+					const filter = command.args.toLowerCase();
+					modelChoices = models.map(model => `${model.provider}/${model.id}`).filter(id => id.toLowerCase().includes(filter));
+					await sendTextReply(firstMessage.chat.id, modelChoices.length
+						? `Available models:\n${modelChoices.map((id, i) => `${i + 1}. ${id}`).join("\n")}\n\nSwitch with /model number or /model provider/model-id.`
+						: "No available models match. Configure credentials in the Pi terminal.");
+					return;
+				}
+				const selector = /^\d+$/.test(command.args) ? modelChoices[Number(command.args) - 1] : command.args;
+				const model = models.find(model => `${model.provider}/${model.id}` === selector);
+				if (!model) {
+					await sendTextReply(firstMessage.chat.id, "Unknown or unavailable model. Use /models, then /model number or /model provider/model-id.");
+					return;
+				}
+				const changed = await pi.setModel(model);
+				await sendTextReply(firstMessage.chat.id, changed ? `Model switched to ${model.provider}/${model.id}.` : "Model switch failed: authentication is not configured.");
+			} catch (error) {
+				await sendTextReply(firstMessage.chat.id, `Model command failed: ${error instanceof Error ? error.message : String(error)}`);
+			} finally {
+				modelCommandInProgress = false;
 			}
 			return;
 		}
@@ -718,7 +838,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/status") {
+		if (lower === "/status" || lower === "/session") {
 			let totalInput = 0;
 			let totalOutput = 0;
 			let totalCacheRead = 0;
@@ -736,8 +856,17 @@ export default function (pi: ExtensionAPI) {
 
 			const usage = ctx.getContextUsage();
 			const lines: string[] = [];
+			if (lower === "/session") {
+				const entries = ctx.sessionManager.getEntries();
+				lines.push(`Session: ${pi.getSessionName() || "(unnamed)"}`);
+				lines.push(`ID: ${ctx.sessionManager.getSessionId()}`);
+				lines.push(`File: ${ctx.sessionManager.getSessionFile() || "(ephemeral)"}`);
+				lines.push(`Directory: ${ctx.cwd}`);
+				lines.push(`Messages: ${entries.filter(entry => entry.type === "message").length}`);
+			}
 			if (ctx.model) {
 				lines.push(`Model: ${ctx.model.provider}/${ctx.model.id}`);
+				lines.push(`Thinking: ${pi.getThinkingLevel()}`);
 			}
 			const tokenParts: string[] = [];
 			if (totalInput) tokenParts.push(`↑${formatTokens(totalInput)}`);
@@ -768,7 +897,7 @@ export default function (pi: ExtensionAPI) {
 		if (lower === "/help" || lower === "/start") {
 			await sendTextReply(
 				firstMessage.chat.id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				`Send me a message and I will forward it to pi. Commands: /status, /session, /compact, /models [filter], /model [number or provider/model-id], /thinking [level], /reload, /stop. Registered Pi commands, skills, and prompt templates are discovered automatically. Terminal-only built-ins are not remotely dispatchable; interactive command dialogs and errors appear in the Pi terminal.`,
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
@@ -778,16 +907,42 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		let sessionCommand: ReturnType<typeof findSessionCommand>;
+		if (command) {
+			sessionCommand = findSessionCommand(pi, command.name);
+			if (!sessionCommand) {
+				await sendTextReply(firstMessage.chat.id, `Unknown or terminal-only command: /${command.name}. Not sent to the AI.`);
+				return;
+			}
+			if (isBusy(ctx)) {
+				await sendTextReply(firstMessage.chat.id, "Cannot execute a command while Pi is busy. Send /stop first and wait for Pi to become idle.");
+				return;
+			}
+			if (sessionCommand.source === "extension") {
+				try {
+					pi.sendUserMessage(command.text, { expandPromptTemplates: true });
+					await sendTextReply(firstMessage.chat.id, `Dispatched ${command.text.split(" ")[0]} to Pi. Command output, dialogs, and execution errors appear in the Pi terminal.`);
+				} catch (error) {
+					await sendTextReply(firstMessage.chat.id, `Command failed: ${error instanceof Error ? error.message : String(error)}`);
+				}
+				return;
+			}
+		}
+
 		const historyTurns = preserveQueuedTurnsAsHistory ? queuedTelegramTurns.splice(0) : [];
 		preserveQueuedTurnsAsHistory = false;
 		const epoch = connectionEpoch;
 		const turn = await createTelegramTurn(messages, historyTurns);
 		if (epoch !== connectionEpoch) return;
+		if (command && sessionCommand) {
+			turn.content = [{ type: "text", text: command.text }];
+			turn.expandPromptTemplates = true;
+		}
 		queuedTelegramTurns.push(turn);
 		if (ctx.isIdle()) {
 			startTypingLoop(ctx, turn.chatId);
 			updateStatus(ctx);
-			pi.sendUserMessage(turn.content, { deliverAs: "followUp" });
+			pi.sendUserMessage(turn.content, { deliverAs: "followUp", ...(turn.expandPromptTemplates ? { expandPromptTemplates: true } : {}) });
 		}
 	}
 
@@ -980,6 +1135,42 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("telegram-reload", {
+		description: "Reload Pi and reconnect Telegram (invoked by Telegram /reload)",
+		handler: async (_args, ctx) => {
+			const request = reloadRequest;
+			if (!request) {
+				ctx.ui.notify("Use /reload from Telegram, or the built-in /reload in the terminal.", "info");
+				return;
+			}
+			reloadRequest = undefined;
+			if (isBusy(ctx) || modelCommandInProgress) {
+				await sendTextReply(request.chatId, "Pi became busy before reloading. Try again when idle.");
+				return;
+			}
+			await sendTextReply(request.chatId, "Reloading Pi. Telegram will reconnect automatically.");
+			const marker = JSON.stringify({ ...request, sessionId: ctx.sessionManager.getSessionId() });
+			// Process-local handoff survives extension replacement, never persisted to disk.
+			process.env[RELOAD_MARKER] = marker;
+			const token = config.botToken;
+			try {
+				await ctx.reload();
+				// Use only captured plain data: some hosts report reload errors without throwing.
+				if (process.env[RELOAD_MARKER] === marker) {
+					throw new Error("Pi did not complete extension replacement; check the terminal diagnostics");
+				}
+			} catch (error) {
+				if (process.env[RELOAD_MARKER] === marker) delete process.env[RELOAD_MARKER];
+				// Only captured plain data is safe if replacement partially completed.
+				await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+					method: "POST", headers: { "content-type": "application/json" },
+					body: JSON.stringify({ chat_id: request.chatId, message_thread_id: request.messageThreadId,
+						text: `Reload failed: ${error instanceof Error ? error.message : String(error)}. Reconnect from the Pi terminal if necessary.` }),
+				});
+			}
+		},
+	});
+
 	pi.registerCommand("telegram-setup", {
 		description: "Configure Telegram bot token",
 		handler: async (_args, ctx) => {
@@ -1048,6 +1239,21 @@ export default function (pi: ExtensionAPI) {
 		config = await readConfig();
 		await mkdir(TEMP_DIR, { recursive: true });
 		updateStatus(ctx);
+		const marker = process.env[RELOAD_MARKER];
+		if (!marker) return;
+		delete process.env[RELOAD_MARKER];
+		let pending: { sessionId: string; chatId: number; messageThreadId?: number };
+		try { pending = JSON.parse(marker); } catch { return; }
+		if (pending.sessionId !== ctx.sessionManager.getSessionId()) return;
+		try {
+			await startPolling(ctx);
+			await sendTextReply(pending.chatId, "Pi reloaded. Telegram reconnected.");
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			updateStatus(ctx, message);
+			await callTelegram("sendMessage", { chat_id: pending.chatId, message_thread_id: pending.messageThreadId,
+				text: `Pi reloaded, but Telegram reconnection failed: ${message}. Run /telegram-connect in the Pi terminal.` }).catch(() => undefined);
+		}
 	});
 
 	pi.on("session_shutdown", async (_event, _ctx) => {
@@ -1068,7 +1274,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("before_agent_start", async (event) => {
-		const suffix = isTelegramPrompt(event.prompt)
+		const suffix = (isTelegramPrompt(event.prompt) || !!queuedTelegramTurns[0]?.expandPromptTemplates)
 			? `${SYSTEM_PROMPT_SUFFIX}\n- The current user message came from Telegram.`
 			: SYSTEM_PROMPT_SUFFIX;
 		return {
@@ -1148,7 +1354,7 @@ export default function (pi: ExtensionAPI) {
 			startTypingLoop(ctx, nextTurn.chatId);
 			updateStatus(ctx);
 			// agent_end can fire while Pi is still processing the current run.
-			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp" });
+			pi.sendUserMessage(nextTurn.content, { deliverAs: "followUp", ...(nextTurn.expandPromptTemplates ? { expandPromptTemplates: true } : {}) });
 		}
 	});
 }
