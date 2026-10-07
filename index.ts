@@ -511,9 +511,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function sendTextReply(chatId: number, text: string): Promise<void> {
+	async function sendTextReply(chatId: number, text: string, messageThreadId?: number): Promise<void> {
 		for (const chunk of chunkParagraphs(text)) {
-			await callTelegram("sendMessage", { chat_id: chatId, text: chunk });
+			await callTelegram("sendMessage", { chat_id: chatId, text: chunk,
+				...(messageThreadId !== undefined ? { message_thread_id: messageThreadId } : {}) });
 		}
 	}
 
@@ -919,11 +920,15 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			if (sessionCommand.source === "extension") {
+				// Dispatch can synchronously disconnect or replace the session. Reply
+				// to the originating topic, not whatever binding remains afterward.
+				const { id: chatId } = firstMessage.chat;
+				const messageThreadId = firstMessage.message_thread_id;
 				try {
 					pi.sendUserMessage(command.text, { expandPromptTemplates: true });
-					await sendTextReply(firstMessage.chat.id, `Dispatched ${command.text.split(" ")[0]} to Pi. Command output, dialogs, and execution errors appear in the Pi terminal.`);
+					await sendTextReply(chatId, `Dispatched ${command.text.split(" ")[0]} to Pi. Command output, dialogs, and execution errors appear in the Pi terminal.`, messageThreadId);
 				} catch (error) {
-					await sendTextReply(firstMessage.chat.id, `Command failed: ${error instanceof Error ? error.message : String(error)}`);
+					await sendTextReply(chatId, `Command failed: ${error instanceof Error ? error.message : String(error)}`, messageThreadId);
 				}
 				return;
 			}

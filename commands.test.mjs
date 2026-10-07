@@ -199,6 +199,23 @@ test('real extension: model switching and unrestricted discovered commands are t
     assert.equal(requests.at(-1).message_thread_id, 42);
     await send('/thinking');
     assert.match(requests.at(-1).text, /Current thinking level/);
+
+    // The real host begins extension handlers synchronously. Disconnect clears
+    // the binding before sendUserMessage returns, so capture the reply topic.
+    discovered.push({ name: 'telegram-disconnect', source: 'extension' });
+    let commandExecution;
+    api.sendUserMessage = (content, options) => {
+      prompts.push({ content, options });
+      if (content === '/telegram-disconnect') {
+        commandExecution = commands.get('telegram-disconnect')('', freshCtx);
+      }
+    };
+    await send('/telegram-disconnect');
+    await commandExecution;
+    assert.match(requests.at(-1).text, /Dispatched \/telegram-disconnect/);
+    assert.equal(requests.at(-1).chat_id, -100);
+    assert.equal(requests.at(-1).message_thread_id, 42,
+      'command acknowledgement must stay in the originating topic after disconnect');
   } finally {
     await hooks.get('session_shutdown')?.({}, cleanupContext);
     if (oldReloadMarker === undefined) delete process.env.PI_TELEGRAM_PENDING_RELOAD;

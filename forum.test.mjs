@@ -79,6 +79,11 @@ test('only supported outgoing methods receive thread parameter; private mode unc
   assert.deepEqual(threadParams('sendMessage', body), body);
   assert.equal(threadParams('sendDocument', { chat_id: '-100' }, binding).message_thread_id, 42);
 });
+test('explicit reply topics survive disconnects and binding changes', () => {
+  const body = { chat_id: -100, message_thread_id: 42, text: 'Command dispatched' };
+  assert.deepEqual(threadParams('sendMessage', body), body);
+  assert.deepEqual(threadParams('sendMessage', body, { chatId: -100, messageThreadId: 43 }), body);
+});
 test('atomic storage and corrupt mappings fail closed', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
   try {
