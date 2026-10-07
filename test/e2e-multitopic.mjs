@@ -17,12 +17,14 @@ import { mkdtemp, mkdir, readFile, writeFile, realpath, rm } from 'node:fs/promi
 import { dirname, join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { isSocketReady, recordMessageEdit } from './e2e-support.mjs';
 
 const count = Number(process.argv[2] ?? 6);
-assert.ok(count >= 1 && count <= 6, 'Topic count must be between 1 and 6');
+assert.ok(Number.isInteger(count) && count >= 1 && count <= 6, 'Topic count must be an integer between 1 and 6');
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const cli = await realpath(process.env.PI_RPC_AUDIT_CLI ?? '/usr/local/bin/pi');
+const cli = await realpath(process.env.PI_RPC_AUDIT_CLI ??
+  fileURLToPath(new URL('./cli.js', import.meta.resolve('@earendil-works/pi-coding-agent'))));
 const model = process.env.PI_MODEL ?? 'gpt-5.4-mini';
 
 // 1. Verify LLM authentication (OpenAI Codex / GPT)
@@ -32,202 +34,228 @@ assert.ok(auth, 'Login to openai-codex in Pi before running this E2E test');
 
 // 2. Setup isolated temp environment
 const tempHome = await mkdtemp(join(tmpdir(), 'pi-telegram-e2e-'));
-const agentDir = join(tempHome, '.pi/agent');
-const runtimeDir = join(agentDir, 'telegram-runtime');
-await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
-
-await writeFile(join(agentDir, 'auth.json'), JSON.stringify({ 'openai-codex': auth }), { mode: 0o600 });
-await writeFile(join(agentDir, 'telegram.json'), JSON.stringify({
-  botToken: '1:e2e_test',
-  botUsername: 'e2e_bot',
-  allowedUserId: 7,
-  forumChatId: -100,
-}), { mode: 0o600 });
-await writeFile(join(runtimeDir, 'cursor.json'), JSON.stringify({ botTokenId: '1', offset: 1 }));
-
-// 3. Mock Telegram API (Local HTTP Server)
-const files = new Map();
-const updates = [];
-const topics = new Map(); // topicId -> sessionIndex
-const sentMessages = [];
-const uploadedDocs = [];
-let nextTopicId = 100;
-let nextMessageId = 1000;
-
-const mockTelegram = createServer(async (req, res) => {
-  try {
-    const url = new URL(req.url, 'http://127.0.0.1');
-
-    // Handle file downloads
-    if (url.pathname.startsWith('/file/')) {
-      const fileId = url.pathname.split('/').pop();
-      assert.ok(files.has(fileId), `File not found: ${fileId}`);
-      res.writeHead(200, { 'content-type': 'text/plain' });
-      return res.end(files.get(fileId));
-    }
-
-    const method = url.pathname.split('/').pop();
-
-    // Read body
-    const chunks = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const rawBody = Buffer.concat(chunks);
-
-    let body = {};
-    if ((req.headers['content-type'] ?? '').startsWith('multipart/')) {
-      const form = await new Response(rawBody, { headers: { 'content-type': req.headers['content-type'] } }).formData();
-      body = Object.fromEntries(form);
-
-      const file = form.get('document');
-      const topicId = Number(form.get('message_thread_id'));
-      const fileBytes = Buffer.from(await file.arrayBuffer());
-      uploadedDocs.push({ topicId, name: file.name, bytes: fileBytes });
-    } else if (rawBody.length > 0) {
-      body = JSON.parse(rawBody.toString('utf8'));
-    }
-
-    let result = true;
-    switch (method) {
-      case 'getMe':
-        result = { id: 1, username: 'e2e_bot' };
-        break;
-      case 'getChat':
-        result = { id: -100, type: 'supergroup', is_forum: true };
-        break;
-      case 'getChatMember':
-        result = { status: 'administrator', can_manage_topics: true };
-        break;
-      case 'createForumTopic': {
-        const topicId = ++nextTopicId;
-        const index = Number(body.name?.match(/Topic (\d+)/)?.[1]);
-        if (index) topics.set(topicId, index);
-        result = { message_thread_id: topicId };
-        break;
-      }
-      case 'getUpdates':
-        result = updates.filter(u => u.update_id >= (body.offset ?? 0)).slice(0, 50);
-        break;
-      case 'getFile':
-        result = { file_id: body.file_id, file_path: body.file_id };
-        break;
-      case 'sendMessage': {
-        const msgId = ++nextMessageId;
-        sentMessages.push({
-          message_id: msgId,
-          topicId: Number(body.message_thread_id),
-          text: body.text,
-        });
-        result = { message_id: msgId };
-        break;
-      }
-      case 'sendDocument':
-        result = { message_id: ++nextMessageId };
-        break;
-      case 'sendChatAction':
-      case 'editMessageText':
-      case 'deleteWebhook':
-      case 'editForumTopic':
-        break;
-      default:
-        throw new Error(`Unexpected Telegram method in mock: ${method}`);
-    }
-
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, result }));
-  } catch (err) {
-    res.writeHead(500, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: false, error: err.message }));
-  }
-});
-
-await new Promise(resolve => mockTelegram.listen(0, '127.0.0.1', resolve));
-const mockUrl = `http://127.0.0.1:${mockTelegram.address().port}`;
-console.log(`[Mock Telegram API] Listening on ${mockUrl}`);
-
-// 4. Helper to manage child processes
 const children = [];
-const env = {
-  ...process.env,
-  HOME: tempHome,
-  PI_CODING_AGENT_DIR: agentDir,
-  TEST_TELEGRAM_URL: mockUrl,
-  NODE_OPTIONS: `--import=${join(root, 'test/mock-telegram.mjs')}`,
-  PI_SKIP_VERSION_CHECK: '1',
-  PI_TELEMETRY: '0',
-  PI_OFFLINE: '1',
-};
+let mockTelegram;
+try {
+  const agentDir = join(tempHome, '.pi/agent');
+  const runtimeDir = join(agentDir, 'telegram-runtime');
+  await mkdir(runtimeDir, { recursive: true, mode: 0o700 });
 
-function spawnProc(name, args, cwd) {
-  const p = spawn(process.execPath, args, { env, cwd, stdio: ['pipe', 'pipe', 'pipe'] });
-  p.procName = name;
-  children.push(p);
-  return p;
-}
+  await writeFile(join(agentDir, 'auth.json'), JSON.stringify({ 'openai-codex': auth }), { mode: 0o600 });
+  await writeFile(join(agentDir, 'telegram.json'), JSON.stringify({
+    botToken: '1:e2e_test',
+    botUsername: 'e2e_bot',
+    allowedUserId: 7,
+    forumChatId: -100,
+  }), { mode: 0o600 });
+  await writeFile(join(runtimeDir, 'cursor.json'), JSON.stringify({ botTokenId: '1', offset: 1 }));
 
-const delay = ms => new Promise(r => setTimeout(r, ms));
-async function waitFor(predicate, label, ms = 60000) {
-  const until = Date.now() + ms;
-  while (Date.now() < until) {
-    if (await predicate()) return;
-    await delay(100);
-  }
-  throw new Error(`Timeout waiting for: ${label}`);
-}
+  // 3. Mock Telegram API (Local HTTP Server)
+  const files = new Map();
+  const updates = [];
+  const topics = new Map(); // topicId -> sessionIndex
+  const sentMessages = [];
+  const uploadedDocs = [];
+  let nextTopicId = 100;
+  let nextMessageId = 1000;
 
-// 5. Start real Dispatcher
-console.log('[Dispatcher] Starting production dispatcher.mjs...');
-const dispatcher = spawnProc('dispatcher', [join(root, 'dispatcher.mjs'), runtimeDir], tempHome);
-dispatcher.stdout.resume();
-await waitFor(async () => {
-  try { return (await readFile(join(runtimeDir, 'dispatcher.sock'))), true; } catch { return false; }
-}, 'dispatcher.sock socket creation', 10000);
-console.log('[Dispatcher] Connected and ready.');
+  mockTelegram = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url, 'http://127.0.0.1');
 
-// 6. Start 6 real Pi processes in RPC mode
-const agents = [];
+      // Handle file downloads
+      if (url.pathname.startsWith('/file/')) {
+        const fileId = url.pathname.split('/').pop();
+        assert.ok(files.has(fileId), `File not found: ${fileId}`);
+        res.writeHead(200, { 'content-type': 'text/plain' });
+        return res.end(files.get(fileId));
+      }
 
-function createRpcClient(child, index) {
-  let seq = 0;
-  const pending = new Map();
-  const state = { index, child, settled: 0, finals: [] };
+      const method = url.pathname.split('/').pop();
 
-  child.stdout.setEncoding('utf8');
-  let buf = '';
-  child.stdout.on('data', chunk => {
-    buf += chunk;
-    let newline;
-    while ((newline = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, newline).trim();
-      buf = buf.slice(newline + 1);
-      if (!line) continue;
-      try {
-        const ev = JSON.parse(line);
-        if (ev.type === 'response') {
-          const p = pending.get(ev.id);
-          if (p) {
-            pending.delete(ev.id);
-            if (ev.success) p.resolve(ev.data); else p.reject(new Error(ev.error));
-          }
-        } else if (ev.type === 'agent_settled') {
-          state.settled++;
-        } else if (ev.type === 'message_end' && ev.message?.role === 'assistant') {
-          const text = ev.message.content?.filter(c => c.type === 'text').map(c => c.text).join('') ?? '';
-          state.finals.push(text);
+      // Read body
+      const chunks = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const rawBody = Buffer.concat(chunks);
+
+      let body = {};
+      if ((req.headers['content-type'] ?? '').startsWith('multipart/')) {
+        const form = await new Response(rawBody, { headers: { 'content-type': req.headers['content-type'] } }).formData();
+        body = Object.fromEntries(form);
+
+        const file = form.get('document');
+        const topicId = Number(form.get('message_thread_id'));
+        const fileBytes = Buffer.from(await file.arrayBuffer());
+        uploadedDocs.push({ topicId, name: file.name, bytes: fileBytes });
+      } else if (rawBody.length > 0) {
+        body = JSON.parse(rawBody.toString('utf8'));
+      }
+
+      let result = true;
+      switch (method) {
+        case 'getMe':
+          result = { id: 1, username: 'e2e_bot' };
+          break;
+        case 'getChat':
+          result = { id: -100, type: 'supergroup', is_forum: true };
+          break;
+        case 'getChatMember':
+          result = { status: 'administrator', can_manage_topics: true };
+          break;
+        case 'createForumTopic': {
+          const topicId = ++nextTopicId;
+          const index = Number(body.name?.match(/Topic (\d+)/)?.[1]);
+          if (index) topics.set(topicId, index);
+          result = { message_thread_id: topicId };
+          break;
         }
-      } catch {}
+        case 'getUpdates':
+          result = updates.filter(u => u.update_id >= (body.offset ?? 0)).slice(0, 50);
+          break;
+        case 'getFile':
+          result = { file_id: body.file_id, file_path: body.file_id };
+          break;
+        case 'sendMessage': {
+          const msgId = ++nextMessageId;
+          sentMessages.push({
+            message_id: msgId,
+            topicId: Number(body.message_thread_id),
+            text: body.text,
+          });
+          result = { message_id: msgId };
+          break;
+        }
+        case 'sendDocument':
+          result = { message_id: ++nextMessageId };
+          break;
+        case 'editMessageText':
+          result = recordMessageEdit(sentMessages, body);
+          break;
+        case 'sendChatAction':
+        case 'deleteWebhook':
+        case 'editForumTopic':
+          break;
+        default:
+          throw new Error(`Unexpected Telegram method in mock: ${method}`);
+      }
+
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result }));
+    } catch (err) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, description: err.message }));
     }
   });
 
-  state.rpc = (type, data = {}) => new Promise((resolve, reject) => {
-    const id = `${index}-${++seq}`;
-    pending.set(id, { resolve, reject });
-    child.stdin.write(JSON.stringify({ id, type, ...data }) + '\n');
-  });
+  await new Promise(resolve => mockTelegram.listen(0, '127.0.0.1', resolve));
+  const mockUrl = `http://127.0.0.1:${mockTelegram.address().port}`;
+  console.log(`[Mock Telegram API] Listening on ${mockUrl}`);
 
-  return state;
-}
+  // 4. Helper to manage child processes
+  const env = {
+    ...process.env,
+    HOME: tempHome,
+    PI_CODING_AGENT_DIR: agentDir,
+    TEST_TELEGRAM_URL: mockUrl,
+    NODE_OPTIONS: `--import=${join(root, 'test/mock-telegram.mjs')}`,
+    PI_SKIP_VERSION_CHECK: '1',
+    PI_TELEMETRY: '0',
+    PI_OFFLINE: '1',
+  };
 
-try {
+  function spawnProc(name, args, cwd) {
+    const p = spawn(process.execPath, args, { env, cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+    p.procName = name;
+    children.push(p);
+    p.once('error', error => { p.spawnError = error; });
+    p.stderr.on('data', chunk => process.stderr.write(`[${name}] ${chunk}`));
+    return p;
+  }
+
+  const delay = ms => new Promise(r => setTimeout(r, ms));
+  async function waitFor(predicate, label, ms = 60000) {
+    const until = Date.now() + ms;
+    while (Date.now() < until) {
+      if (await predicate()) return;
+      await delay(100);
+    }
+    throw new Error(`Timeout waiting for: ${label}`);
+  }
+
+  // 5. Start real Dispatcher
+  console.log('[Dispatcher] Starting production dispatcher.mjs...');
+  const dispatcher = spawnProc('dispatcher', [join(root, 'dispatcher.mjs'), runtimeDir], tempHome);
+  dispatcher.stdout.resume();
+  await waitFor(() => {
+    if (dispatcher.spawnError) throw dispatcher.spawnError;
+    if (dispatcher.exitCode !== null || dispatcher.signalCode !== null) {
+      throw new Error('Dispatcher exited before creating its socket');
+    }
+    return isSocketReady(join(runtimeDir, 'dispatcher.sock'));
+  }, 'dispatcher.sock socket creation', 10000);
+  console.log('[Dispatcher] Connected and ready.');
+
+  // 6. Start 6 real Pi processes in RPC mode
+  const agents = [];
+
+  function createRpcClient(child, index) {
+    let seq = 0;
+    const pending = new Map();
+    const state = { index, child, settled: 0, finals: [] };
+
+    child.stdout.setEncoding('utf8');
+    let buf = '';
+    child.stdout.on('data', chunk => {
+      buf += chunk;
+      let newline;
+      while ((newline = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, newline).trim();
+        buf = buf.slice(newline + 1);
+        if (!line) continue;
+        try {
+          const ev = JSON.parse(line);
+          if (ev.type === 'response') {
+            const p = pending.get(ev.id);
+            if (p) {
+              pending.delete(ev.id);
+              if (ev.success) p.resolve(ev.data); else p.reject(new Error(ev.error));
+            }
+          } else if (ev.type === 'agent_settled') {
+            state.settled++;
+          } else if (ev.type === 'message_end' && ev.message?.role === 'assistant') {
+            const text = ev.message.content?.filter(c => c.type === 'text').map(c => c.text).join('') ?? '';
+            state.finals.push(text);
+          }
+        } catch {}
+      }
+    });
+
+    let failure;
+    const fail = error => {
+      failure = error;
+      for (const p of pending.values()) p.reject(error);
+      pending.clear();
+    };
+    child.on('error', fail);
+    child.on('exit', (code, signal) => fail(new Error(`Pi ${index} exited (${signal ?? code})`)));
+    child.stdin.on('error', fail);
+    state.rpc = (type, data = {}) => new Promise((resolve, reject) => {
+      if (failure) return reject(failure);
+      const id = `${index}-${++seq}`;
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`Timeout waiting for Pi ${index} RPC ${type}`));
+      }, 60000);
+      pending.set(id, {
+        resolve: value => { clearTimeout(timer); resolve(value); },
+        reject: error => { clearTimeout(timer); reject(error); },
+      });
+      child.stdin.write(JSON.stringify({ id, type, ...data }) + '\n');
+    });
+
+    return state;
+  }
+
   console.log(`[Pi Sessions] Launching ${count} real Pi instances (--mode rpc, model: ${model})...`);
   for (let i = 1; i <= count; i++) {
     const workDir = join(tempHome, `work-${i}`);
@@ -328,10 +356,13 @@ try {
   console.log(`\n🎉 ALL TESTS PASSED: Dispatcher cleanly multiplexed ${count} concurrent topics with text and attachments.`);
 } finally {
   console.log('\n[Teardown] Cleaning up processes and temp files...');
-  for (const child of children) {
-    try { child.kill('SIGTERM'); } catch {}
-  }
-  mockTelegram.closeAllConnections();
-  mockTelegram.close();
+  await Promise.all(children.map(child => new Promise(resolve => {
+    if (!child.pid || child.exitCode !== null || child.signalCode !== null) return resolve();
+    const timer = setTimeout(() => child.kill('SIGKILL'), 2000);
+    child.once('exit', () => { clearTimeout(timer); resolve(); });
+    child.kill('SIGTERM');
+  })));
+  mockTelegram?.closeAllConnections();
+  if (mockTelegram?.listening) await new Promise(resolve => mockTelegram.close(resolve));
   await rm(tempHome, { recursive: true, force: true }).catch(() => {});
 }

@@ -711,7 +711,10 @@ export default function (pi: ExtensionAPI) {
 		const firstMessage = messages[0];
 		if (!firstMessage) return;
 		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		const command = messages.length === 1 && !collectTelegramFileInfos(messages).length
+		const fileInfos = collectTelegramFileInfos(messages);
+		// Service events (topic close/reopen, pins, etc.) are not user requests.
+		if (!rawText && fileInfos.length === 0) return;
+		const command = messages.length === 1 && !fileInfos.length
 			? parseTelegramCommand(rawText, config.botUsername) : undefined;
 		if (command?.ignored) return;
 		const lower = (command?.text ?? rawText).toLowerCase();

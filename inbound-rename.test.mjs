@@ -55,7 +55,11 @@ test('real extension: rename isolation, media downloads and topic-scoped replies
     }
     assert.equal(state.renames.length, 1);
     assert.equal(name, 'Backend');
-    assert.deepEqual(state.prompts, []);
+    for (const service of [{ forum_topic_closed: {} }, { forum_topic_reopened: {} },
+      { pinned_message: { message_id: 2 } }]) {
+      await state.onUpdate({ message: { ...message, forum_topic_edited: undefined, ...service } });
+    }
+    assert.deepEqual(state.prompts, [], 'topic service events must never start an AI turn');
     await state.onUpdate({ message: { ...message, forum_topic_edited: { name: 'π session — claaro' } } });
     assert.equal(name, 'claaro');
     assert.equal(state.renames.length, 2);

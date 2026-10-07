@@ -59,6 +59,10 @@ flowchart TB
 
 ## Ejecución
 
+Requiere credenciales `openai-codex` válidas y realiza llamadas al modelo real (puede consumir cuota). Usa el CLI del paquete Pi instalado; para probar otro build, configura `PI_RPC_AUDIT_CLI=/ruta/a/dist/cli.js`.
+
+`npm test` incluye pruebas locales de readiness, ediciones de streaming y limpieza ante fallos del runner, sin credenciales reales ni llamadas al modelo.
+
 ### Ejecución Rápida (1 Sesión)
 ```bash
 node test/e2e-multitopic.mjs 1
