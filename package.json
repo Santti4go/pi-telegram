@@ -13,6 +13,7 @@
     "dispatcher.mjs",
     "forum-client.mjs",
     "forum.mjs",
+    "commands.mjs",
     "README.md",
     "screenshot.png"
   ],

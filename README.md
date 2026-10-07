@@ -127,6 +127,57 @@ The extension streams assistant text previews back to Telegram while pi is gener
 
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
+## Commands from Telegram
+
+The paired account can use `/models [filter]` to list authenticated chat models, then
+`/model number` (from the most recent list in this connection) or
+`/model provider/model-id` to change only this Pi session's model. `/model` shows
+the current model. Model changes do not alter the default for new sessions. Busy
+sessions reject switches; use `/stop` and wait until idle before retrying.
+
+Use `/thinking` to see the current thinking level, or `/thinking high` to change
+it for this session. Accepted levels: `off`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`. Pi limits the setting to the model's capabilities; the reply
+reports the effective level if it differs from the requested one. Changes require
+an idle session and no model command in progress; reading the level works while
+busy. The setting does not change the default for new sessions. `/status` also
+shows the current thinking level.
+
+`/session` shows the session name, ID, file, working directory, message count,
+model, thinking level, token usage, cost, and context usage.
+
+`/reload` reloads Pi's extensions/resources when idle and automatically reconnects
+this Telegram bridge to the same session/topic. It acknowledges before reloading
+and confirms reconnection from the fresh runtime. If reconnection fails, use
+`/telegram-connect` in the terminal. To use it for the first time, load this version
+via the terminal's `/reload` and reconnect once. This reload does not restart Pi or
+its shared forum dispatcher; native `.mjs` changes can still require a full restart
+of all forum clients, as described below.
+
+Other extension commands, skills, and prompt templates are discovered at runtime
+from Pi's command registry and dispatched with their original arguments, without
+an allowlist or per-command mapping. `/command@BotUsername arguments` is supported
+in both private chats and topics; commands addressed to another bot are ignored.
+Unknown commands are rejected, never passed to the AI as ordinary messages.
+Commands must be standalone text messages (not attachment captions).
+
+**Pi API limitation:** built-in terminal commands such as `/login` and `/new`
+are not exposed by the extension command dispatcher. They return an
+unsupported/unknown-command error rather than silently prompting the AI.
+The bridge retains its `/help`, `/start`, `/status`, `/compact`, and `/stop`
+commands, and adapts `/session`, `/reload`, model selection, and thinking levels
+as described above. Extension commands are
+executed in Pi, but their dialogs, notifications, and asynchronous execution errors
+still appear in the **Pi terminal**, not Telegram. A dispatch acknowledgement is
+not a success confirmation. Skills and prompt templates produce normal
+Telegram-scoped AI replies. Native extension commands require an idle session.
+
+All registered extension commands are available to the paired account, including
+commands that can change configuration, disconnect the bridge, or run code. There
+is no additional command permission gate. In forum mode, authorization and the
+bound topic are checked before dispatch; other group members cannot execute
+commands. Keep the group private because members can still read replies.
+
 ## Forum topics: one topic per Pi session
 
 Forum mode requires Node.js 22+, Unix-domain sockets, and the `flock` executable (typically provided by `util-linux`). Private mode does not require `flock`.

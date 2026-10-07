@@ -19,7 +19,8 @@ export function accepts(message, binding, userId) {
     message.chat.id === binding.chatId && message.message_thread_id === binding.messageThreadId;
 }
 export function threadParams(method, body, binding) {
-  return binding && String(body.chat_id) === String(binding.chatId) && THREADED_METHODS.has(method)
+  return binding && body.message_thread_id === undefined &&
+    String(body.chat_id) === String(binding.chatId) && THREADED_METHODS.has(method)
     ? { ...body, message_thread_id: binding.messageThreadId } : body;
 }
 export function topicNameFor(name) {
